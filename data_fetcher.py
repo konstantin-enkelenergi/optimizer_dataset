@@ -14,7 +14,7 @@ cv as (
     FROM charger c
     LEFT JOIN vehicle v
     ON v.account_id = c.account_id
-    WHERE c.removed_at IS NULL AND v.removed_at IS NULL
+    WHERE c.removed_at IS NULL AND v.removed_at IS NULL and c.id != -1
 ),
 ve as (
     SELECT 
@@ -53,23 +53,119 @@ SELECT
     MODE() WITHIN GROUP (ORDER BY is_fully_charged) AS is_fully_charged
 
 FROM events
+WHERE vehicle_id IS NOT NULL AND charger_id IS NOT NULL
 GROUP BY 1, 2, 3
 ORDER BY time_block, charger_id, vehicle_id;
 """
 
 ALGO_SQL = """
-WITH algo_event as (
+WITH 
+-- Generate continuous 15-minute time blocks for the period (no gaps)
+time_blocks AS (
+    SELECT generate_series(
+        date_bin('15 minutes', NOW() - INTERVAL '%(history_days)s days', TIMESTAMP '2025-01-01'),
+        date_bin('15 minutes', NOW(), TIMESTAMP '2025-01-01'),
+        INTERVAL '15 minutes'
+    ) AS time_block
+),
+
+-- Get all chargers that have records in the period
+chargers AS (
+    SELECT DISTINCT charger_id 
+    FROM charger_record
+    WHERE created_at >= NOW() - INTERVAL '%(history_days)s days'
+),
+
+-- Create all combinations of time_blocks and chargers (ensures no gaps)
+all_combinations AS (
+    SELECT t.time_block, c.charger_id
+    FROM time_blocks t
+    CROSS JOIN chargers c
+),
+
+-- Original core logic: get records within the period
+algo_event AS (
     SELECT created_at, charger_id, ready_time, target_kwh 
     FROM charger_record
     WHERE created_at >= NOW() - INTERVAL '%(history_days)s days'
+),
+
+-- Get distinct records per time_block and charger (core logic preserved)
+actual_records AS (
+    SELECT DISTINCT ON (time_block, charger_id)
+        date_bin('15 minutes', created_at, TIMESTAMP '2025-01-01') AS time_block,
+        charger_id,
+        ready_time,
+        target_kwh
+    FROM algo_event
+    ORDER BY time_block, charger_id, created_at
+),
+
+-- Fallback: most recent record BEFORE the period for each charger (unlimited lookback)
+fallback_values AS (
+    SELECT DISTINCT ON (charger_id)
+        charger_id,
+        ready_time AS fallback_ready_time,
+        target_kwh AS fallback_target_kwh
+    FROM charger_record
+    WHERE created_at < NOW() - INTERVAL '%(history_days)s days'
+    ORDER BY charger_id, created_at DESC
+),
+
+-- Join all combinations with actual records and fallback values
+combined AS (
+    SELECT 
+        ac.time_block,
+        ac.charger_id,
+        ar.ready_time,
+        ar.target_kwh,
+        fv.fallback_ready_time,
+        fv.fallback_target_kwh
+    FROM all_combinations ac
+    LEFT JOIN actual_records ar 
+        ON ac.time_block = ar.time_block 
+        AND ac.charger_id = ar.charger_id
+    LEFT JOIN fallback_values fv 
+        ON ac.charger_id = fv.charger_id
+),
+
+-- Create groups for forward-fill (last non-null value carry-forward)
+with_groups AS (
+    SELECT 
+        time_block,
+        charger_id,
+        ready_time,
+        target_kwh,
+        fallback_ready_time,
+        fallback_target_kwh,
+        COUNT(ready_time) OVER (PARTITION BY charger_id ORDER BY time_block) AS ready_time_grp,
+        COUNT(target_kwh) OVER (PARTITION BY charger_id ORDER BY time_block) AS target_kwh_grp
+    FROM combined
 )
-SELECT DISTINCT ON (time_block, charger_id)
-    date_bin('15 minutes', created_at, TIMESTAMP '2025-01-01') AS time_block,
+
+-- Final output with gap filling
+SELECT 
+    time_block,
     charger_id,
-    ready_time,
-    target_kwh
-FROM algo_event
-ORDER BY time_block, charger_id, created_at;
+    COALESCE(
+        ready_time,
+        FIRST_VALUE(ready_time) OVER (
+            PARTITION BY charger_id, ready_time_grp 
+            ORDER BY time_block
+        ),
+        fallback_ready_time
+    ) AS ready_time,
+    COALESCE(
+        target_kwh,
+        FIRST_VALUE(target_kwh) OVER (
+            PARTITION BY charger_id, target_kwh_grp 
+            ORDER BY time_block
+        ),
+        fallback_target_kwh
+    ) AS target_kwh
+FROM with_groups
+WHERE ready_time IS NOT NULL AND target_kwh IS NOT NULL
+ORDER BY time_block, charger_id;
 """
 
 STATUSES_SQL = """
@@ -271,7 +367,9 @@ class DataFetcher:
 
         for df in [df_evp, df_schedule, df_status, df_conn]:
             if not df.empty and "charger_id" in df.columns:
-                df["charger_id"] = pd.to_numeric(df["charger_id"], errors="coerce").astype("Int64")
+                df["charger_id"] = pd.to_numeric(df["charger_id"], errors="coerce").astype("Int32")
+        df_evp["vehicle_id"] = pd.to_numeric(df_evp["vehicle_id"], errors="coerce").astype("Int32")
+        df_evp["grid_area"] = pd.to_numeric(df_evp["grid_area"], errors="coerce").astype("Int16")
 
         # Ensure Datetime types
         for df in [df_evp, df_schedule, df_status, df_conn]:
@@ -285,7 +383,10 @@ class DataFetcher:
 
         dfs = [df_evp, df_schedule, df_status, df_conn]
 
-        final_df = reduce(lambda left, right: pd.merge(left, right, on=["time_block", "charger_id"], how="outer"), dfs)
+        final_df = reduce(lambda left, right: pd.merge(left, right, on=["time_block", "charger_id"], how="left"), dfs)
+        final_df["is_connected"].fillna(False, inplace=True)
+        # Fill NaN values in 'target_kwh' with the previous valid observation for each charger
+        final_df["target_kwh"] = final_df.groupby("charger_id")["target_kwh"].ffill()
 
         # battery_level_pct mapped from enode_soc
         final_df["battery_level_pct"] = final_df["enode_soc"]
@@ -296,7 +397,7 @@ class DataFetcher:
 
         # Rename is_connected to is_charger_connected
         final_df = final_df.rename(columns={"is_connected": "is_charger_connected"})
-        final_df["connector_id"] = pd.to_numeric(final_df["connector_id"], errors="coerce").astype("Int64")
+        final_df["connector_id"] = pd.to_numeric(final_df["connector_id"], errors="coerce").astype("Int8")
 
         # Select specific output columns in order
         output_columns = [
