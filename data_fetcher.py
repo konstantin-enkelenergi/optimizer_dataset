@@ -1,16 +1,23 @@
 from __future__ import annotations
+from datetime import datetime
 from functools import reduce
+import gzip
+import logging
+from pathlib import Path
+import re
+from typing import Callable, TextIO
 
 import pandas as pd
+import dask.dataframe as dd
 from sqlalchemy import create_engine
+from tqdm import tqdm
 
 from config import DBConnectionConfig, DataFetcherConfig
 
 CHARGER_VEHICLE_SQL = """
-WITH events AS (
-    WITH 
+WITH 
 cv as (
-    SELECT c.id as charger_id, v.id as vehicle_id, c.price_area, c.grid_area, c.battery_kwh as user_battery_kwh 
+    SELECT c.id as charger_id, c.serial_id, v.id as vehicle_id, c.price_area, c.grid_area, c.battery_kwh as user_battery_kwh 
     FROM charger c
     LEFT JOIN vehicle v
     ON v.account_id = c.account_id
@@ -23,320 +30,62 @@ ve as (
         is_plugged_in, 
         is_charging, 
         is_fully_charged, 
-        battery_level_pct as enode_soc,
+        battery_level_pct,
         battery_capacity_kwh as enode_battery_kwh
     FROM vehicle_event
-    WHERE event_at >= NOW() - INTERVAL '%(history_days)s days'
+    WHERE event_at >= %(from_time)s::timestamp AND event_at <= %(to_time)s::timestamp
 )
-SELECT ve.event_at, cv.charger_id, cv.vehicle_id, cv.price_area, cv.grid_area, cv.user_battery_kwh,
-    ve.is_plugged_in, ve.is_charging, ve.is_fully_charged, ve.enode_soc, ve.enode_battery_kwh
+SELECT ve.event_at as at, cv.charger_id, cv.serial_id, cv.vehicle_id, cv.price_area, cv.grid_area, cv.user_battery_kwh,
+    ve.is_plugged_in, ve.is_charging, ve.is_fully_charged, ve.battery_level_pct, ve.enode_battery_kwh
 FROM ve
 LEFT JOIN cv
 ON cv.vehicle_id = ve.vehicle_id
-)
-SELECT 
-    -- Snaps the timestamp to the start of the 15-minute block
-    to_timestamp(floor(extract(epoch FROM event_at) / 900) * 900) AT TIME ZONE 'UTC' AS time_block,
-    charger_id,
-    vehicle_id,
-    
-    -- Rule 1: Get the last value in the block
-    (ARRAY_AGG(price_area ORDER BY event_at))[1] AS price_area,
-    (ARRAY_AGG(grid_area ORDER BY event_at))[1] AS grid_area,
-    (ARRAY_AGG(user_battery_kwh ORDER BY event_at))[1] AS user_battery_kwh,
-    (ARRAY_AGG(enode_soc ORDER BY event_at))[1] AS enode_soc,
-    (ARRAY_AGG(enode_battery_kwh ORDER BY event_at))[1] AS enode_battery_kwh,
-    
-    -- Rule 2: Pick the most frequent boolean value
-    MODE() WITHIN GROUP (ORDER BY is_plugged_in) AS is_plugged_in,
-    MODE() WITHIN GROUP (ORDER BY is_charging) AS is_charging,
-    MODE() WITHIN GROUP (ORDER BY is_fully_charged) AS is_fully_charged
-
-FROM events
-WHERE vehicle_id IS NOT NULL AND charger_id IS NOT NULL
-GROUP BY 1, 2, 3
-ORDER BY time_block, charger_id, vehicle_id;
-"""
-
-ALGO_SQL = """
-WITH 
--- Generate continuous 15-minute time blocks for the period (no gaps)
-time_blocks AS (
-    SELECT generate_series(
-        date_bin('15 minutes', NOW() - INTERVAL '%(history_days)s days', TIMESTAMP '2025-01-01'),
-        date_bin('15 minutes', NOW(), TIMESTAMP '2025-01-01'),
-        INTERVAL '15 minutes'
-    ) AS time_block
-),
-
--- Get all chargers that have records in the period
-chargers AS (
-    SELECT DISTINCT charger_id 
-    FROM charger_record
-    WHERE created_at >= NOW() - INTERVAL '%(history_days)s days'
-),
-
--- Create all combinations of time_blocks and chargers (ensures no gaps)
-all_combinations AS (
-    SELECT t.time_block, c.charger_id
-    FROM time_blocks t
-    CROSS JOIN chargers c
-),
-
--- Original core logic: get records within the period
-algo_event AS (
-    SELECT created_at, charger_id, ready_time, target_kwh 
-    FROM charger_record
-    WHERE created_at >= NOW() - INTERVAL '%(history_days)s days'
-),
-
--- Get distinct records per time_block and charger (core logic preserved)
-actual_records AS (
-    SELECT DISTINCT ON (time_block, charger_id)
-        date_bin('15 minutes', created_at, TIMESTAMP '2025-01-01') AS time_block,
-        charger_id,
-        ready_time,
-        target_kwh
-    FROM algo_event
-    ORDER BY time_block, charger_id, created_at
-),
-
--- Fallback: most recent record BEFORE the period for each charger (unlimited lookback)
-fallback_values AS (
-    SELECT DISTINCT ON (charger_id)
-        charger_id,
-        ready_time AS fallback_ready_time,
-        target_kwh AS fallback_target_kwh
-    FROM charger_record
-    WHERE created_at < NOW() - INTERVAL '%(history_days)s days'
-    ORDER BY charger_id, created_at DESC
-),
-
--- Join all combinations with actual records and fallback values
-combined AS (
-    SELECT 
-        ac.time_block,
-        ac.charger_id,
-        ar.ready_time,
-        ar.target_kwh,
-        fv.fallback_ready_time,
-        fv.fallback_target_kwh
-    FROM all_combinations ac
-    LEFT JOIN actual_records ar 
-        ON ac.time_block = ar.time_block 
-        AND ac.charger_id = ar.charger_id
-    LEFT JOIN fallback_values fv 
-        ON ac.charger_id = fv.charger_id
-),
-
--- Create groups for forward-fill (last non-null value carry-forward)
-with_groups AS (
-    SELECT 
-        time_block,
-        charger_id,
-        ready_time,
-        target_kwh,
-        fallback_ready_time,
-        fallback_target_kwh,
-        COUNT(ready_time) OVER (PARTITION BY charger_id ORDER BY time_block) AS ready_time_grp,
-        COUNT(target_kwh) OVER (PARTITION BY charger_id ORDER BY time_block) AS target_kwh_grp
-    FROM combined
-)
-
--- Final output with gap filling
-SELECT 
-    time_block,
-    charger_id,
-    COALESCE(
-        ready_time,
-        FIRST_VALUE(ready_time) OVER (
-            PARTITION BY charger_id, ready_time_grp 
-            ORDER BY time_block
-        ),
-        fallback_ready_time
-    ) AS ready_time,
-    COALESCE(
-        target_kwh,
-        FIRST_VALUE(target_kwh) OVER (
-            PARTITION BY charger_id, target_kwh_grp 
-            ORDER BY time_block
-        ),
-        fallback_target_kwh
-    ) AS target_kwh
-FROM with_groups
-WHERE ready_time IS NOT NULL AND target_kwh IS NOT NULL
-ORDER BY time_block, charger_id;
+WHERE cv.charger_id IS NOT NULL
+ORDER BY at;
 """
 
 STATUSES_SQL = """
-WITH RECURSIVE
-charger_events as (
-    SELECT updated_at, charger_id, connector_id, new_status 
-    FROM evse_status
-),
--- 1. Prepare Intervals: Get the start and end time for each status
-intervals AS (
-    SELECT
-        charger_id,
-        connector_id,
-        new_status,
-        updated_at AS valid_from,
-        -- The status is valid until the next update, or NOW() if it's the latest
-        LEAD(updated_at, 1, NOW()) OVER (
-            PARTITION BY charger_id, connector_id 
-            ORDER BY updated_at
-        ) AS valid_to
-    FROM charger_events
-    WHERE updated_at >= NOW() - INTERVAL '%(history_days)s days'
-),
--- 2. Define Boundaries: Find the total time range to generate the 15-min grid
-bounds AS (
-    SELECT 
-        date_trunc('hour', MIN(valid_from)) AS min_time,
-        date_trunc('hour', MAX(valid_to)) + interval '1 hour' AS max_time
-    FROM intervals
-),
--- 3. Generate Grid: Create 15-minute buckets (00, 15, 30, 45)
-buckets AS (
-    SELECT generate_series(min_time, max_time, interval '15 minutes') AS bucket_start
-    FROM bounds
-),
--- 4. Slice & Calculate: Join intervals to buckets and calculate overlap duration
-bucket_stats AS (
-    SELECT
-        b.bucket_start,
-        i.charger_id,
-        i.connector_id,
-        i.new_status,
-        -- Calculate how many seconds this status existed within this specific 15m bucket
-        EXTRACT(EPOCH FROM (
-            LEAST(i.valid_to, b.bucket_start + interval '15 minutes') - 
-            GREATEST(i.valid_from, b.bucket_start)
-        )) AS duration_seconds
-    FROM intervals i
-    JOIN buckets b 
-      -- Join only if the status interval overlaps with the bucket
-      ON i.valid_from < b.bucket_start + interval '15 minutes'
-     AND i.valid_to > b.bucket_start
-),
--- 5. Aggregate: Sum durations (in case a status toggles back and forth within 15m)
-aggregated_stats AS (
-    SELECT
-        bucket_start,
-        charger_id,
-        connector_id,
-        new_status,
-        SUM(duration_seconds) AS total_seconds
-    FROM bucket_stats
-    GROUP BY 1, 2, 3, 4
-),
--- 6. Rank: Pick the status with the longest duration per bucket/charger/connector
-ranked_stats AS (
-    SELECT
-        *,
-        ROW_NUMBER() OVER (
-            PARTITION BY bucket_start, charger_id, connector_id 
-            ORDER BY total_seconds DESC
-        ) as rn
-    FROM aggregated_stats
-)
--- Final Result: Filter for the top ranked status
-SELECT
-    bucket_start AS time_block,
-    charger_id,
-    connector_id,
-    new_status as status
-FROM ranked_stats
-WHERE rn = 1
-ORDER BY time_block, charger_id, connector_id;
+SELECT updated_at as at, charger_id, connector_id, new_status as status
+FROM evse_status
+WHERE updated_at >= %(from_time)s::timestamp AND updated_at <= %(to_time)s::timestamp AND charger_id != -1
+ORDER BY at;
 """
 
 HB_SQL = """
-WITH
-bounds AS (
-  SELECT
-    date_bin('15 minutes', MIN(recorded_at), '2000-01-01 00:00:00+00'::timestamptz) AS start_block,
-    date_bin('15 minutes', MAX(recorded_at), '2000-01-01 00:00:00+00'::timestamptz) AS end_block
-  FROM heartbeat
-  WHERE recorded_at >= NOW() - INTERVAL '%(history_days)s days'
-),
-chargers AS (
-  SELECT DISTINCT charger_id
-  FROM heartbeat
-),
-blocks AS (
-  SELECT
-    gs AS time_block,
-    gs + interval '15 minutes' AS time_block_end
-  FROM bounds b
-  CROSS JOIN LATERAL generate_series(b.start_block, b.end_block, interval '15 minutes') AS gs
-),
-
--- Each heartbeat keeps the charger "connected" for 30s after it.
-hb_intervals AS (
-  SELECT
-    charger_id,
-    recorded_at AS start_time,
-    recorded_at + interval '30 seconds' AS end_time
-  FROM heartbeat
-),
-
--- Merge overlapping 30s intervals per charger (gap-and-island).
-ordered AS (
-  SELECT
-    *,
-    max(end_time) OVER (
-      PARTITION BY charger_id
-      ORDER BY start_time
-      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-    ) AS prev_max_end
-  FROM hb_intervals
-),
-grouped AS (
-  SELECT
-    *,
-    sum(
-      CASE WHEN prev_max_end IS NULL OR start_time > prev_max_end THEN 1 ELSE 0 END
-    ) OVER (PARTITION BY charger_id ORDER BY start_time) AS island_id
-  FROM ordered
-),
-connected_spans AS (
-  SELECT
-    charger_id,
-    min(start_time) AS connected_start,
-    max(end_time)   AS connected_end
-  FROM grouped
-  GROUP BY charger_id, island_id
-),
-
-per_block AS (
-  SELECT
-    bl.time_block,
-    c.charger_id,
-    coalesce(
-      sum(
-        extract(epoch FROM
-          least(cs.connected_end,   bl.time_block_end)
-          - greatest(cs.connected_start, bl.time_block)
-        )
-      ),
-      0
-    ) AS connected_seconds
-  FROM blocks bl
-  CROSS JOIN chargers c
-  LEFT JOIN connected_spans cs
-    ON cs.charger_id = c.charger_id
-   AND cs.connected_end   > bl.time_block
-   AND cs.connected_start < bl.time_block_end
-  GROUP BY bl.time_block, c.charger_id
+WITH heartbeat_analysis AS (
+    SELECT
+        charger_id,
+        recorded_at,
+        LAG(recorded_at) OVER w AS prev_heartbeat,
+        LEAD(recorded_at) OVER w AS next_heartbeat
+    FROM heartbeat
+    -- Expanded Window: Look back and forward to capture context
+    -- Buffering by 30s is the bare minimum; slightly larger is safer to catch the "bridge" heartbeats.
+    WHERE recorded_at >= %(from_time)s::timestamp AND recorded_at <= %(to_time)s::timestamp AND charger_id != -1
+    WINDOW w AS (PARTITION BY charger_id ORDER BY recorded_at)
 )
+SELECT event_at as at, charger_id, is_connected as is_charger_connected
+FROM (
+    SELECT
+        charger_id,
+        recorded_at AS event_at,
+        true AS is_connected
+    FROM heartbeat_analysis
+    WHERE prev_heartbeat IS NULL 
+       OR recorded_at > prev_heartbeat + interval '30 seconds'
 
-SELECT
-  time_block,
-  charger_id,
-  (connected_seconds >= 450) AS is_connected   -- 7.5 minutes = 450 seconds
-FROM per_block
-ORDER BY time_block, charger_id;
+    UNION ALL
+
+    SELECT
+        charger_id,
+        recorded_at + interval '30 seconds' AS event_at,
+        false AS is_connected
+    FROM heartbeat_analysis
+    WHERE next_heartbeat IS NULL 
+       OR next_heartbeat > recorded_at + interval '30 seconds'
+) events
+-- Final Filter: Only show events that actually happened within the requested window
+ORDER BY event_at, charger_id;
 """
 
 
@@ -346,60 +95,207 @@ class DataFetcher:
         DataFetcher._validate_cfg(cfg.logdb_cfg)
         self.cfg = cfg
 
-    def _load_data(self, history_days: int | None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        if history_days is None:
-            history_days = 365 * 10
+    def _ffill_schedule_partition(self, df: dd.DataFrame) -> dd.DataFrame:
+        sdf: dd.DataFrame = df.sort_values("time_block")
+        sdf[["ready_time", "target_soc"]] = sdf.groupby("serial_id")[["ready_time", "target_soc"]].ffill()
+        return sdf
 
+    def _fill_partition(self, df: pd.DataFrame) -> pd.DataFrame:
+        # This runs on each partition individually
+        ids = ["charger_id", "vehicle_id"]
+        df["is_charger_connected"] = df["is_charger_connected"].fillna(False)
+        # Sort inside the partition to ensure time is correct for ffill
+        df = df.sort_values("time_block")
+        cols = list(df.columns.difference(ids))
+        df[cols] = df.groupby(ids)[cols].ffill()
+        df[cols] = df.groupby(ids)[cols].bfill()
+        return df
+
+    def _agg_last(self, column: pd.Series):
+        if column.empty:
+            return None
+        return column.iloc[-1]
+
+    def _agg_mode(self, column: pd.Series):
+        m = column.mode()
+        if m.empty:
+            return None
+        return m.iloc[0]
+
+    def _aggregate(
+        self, df: pd.DataFrame, ids: list[str], agg: dict[str, Callable], time_col: str = "at"
+    ) -> pd.DataFrame:
+        resampled = (df.groupby(ids).resample("15min", on=time_col).agg(agg)).reset_index()  # type: ignore
+        group = resampled.groupby(ids)
+        cols = df.columns.difference(ids)
+        resampled[cols] = group[cols].ffill()
+        resampled.rename(columns={time_col: "time_block"}, inplace=True)
+        return resampled
+
+    def _parse_eco_log(self, log_line: str) -> tuple[datetime, str, str, int] | None:
+        if "Updated eco mode data fetched successfully" not in log_line:
+            return None
+
+        pattern = r"^\[(?P<ts>[\d. :]+)\].*?chid:\s(?P<chid>\w+).*?\)\s(?P<time>\d{1,2}:\d{2}).*?int32=(?P<soc>\d{1,3})"
+
+        match = re.search(pattern, log_line)
+
+        if match:
+            # Extract raw strings
+            raw_ts = match.group("ts")
+            chid = match.group("chid")
+            ready_time = match.group("time")
+            target_soc = match.group("soc")
+            try:
+                timestamp = datetime.strptime(raw_ts, "%d.%m.%Y %H:%M:%S")
+                return timestamp, chid, ready_time, int(target_soc)
+            except ValueError as e:
+                logging.error(e)
+        return None
+
+    def _parse_file(self, file: TextIO, data: dict[str, list[str | datetime | int]]):
+        for line in file:
+            result = self._parse_eco_log(line)
+            if result:
+                data["at"].append(result[0])
+                data["serial_id"].append(result[1])
+                data["ready_time"].append(result[2])
+                data["target_soc"].append(result[3])
+
+    def _load_logs(self, root: Path) -> pd.DataFrame:
+        logging.info("Loading logs...")
+        data = {
+            "at": [],
+            "serial_id": [],
+            "ready_time": [],
+            "target_soc": [],
+        }
+        files = list(root.glob("*.gz"))
+        for zipped in tqdm(files):
+            with gzip.open(zipped, "rt") as f:
+                self._parse_file(f, data)
+        return pd.DataFrame(data)
+
+    def _load_data(
+        self,
+        from_time: datetime | None,
+        to_time: datetime | None,
+        log_root: Path,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         logdb_engine = create_engine(self.cfg.logdb_cfg.connection_str())
         evpdb_engine = create_engine(self.cfg.evpdb_cfg.connection_str())
 
+        from_time = from_time or datetime.min
+        to_time = to_time or datetime.now()
+        params = {"from_time": from_time, "to_time": to_time}
+
+        logging.info("Quering databases...")
         # Static Info
-        veh_events = pd.read_sql(CHARGER_VEHICLE_SQL, evpdb_engine, params={"history_days": history_days})
-        algo = pd.read_sql(ALGO_SQL, evpdb_engine, params={"history_days": history_days})
-        statuses = pd.read_sql(STATUSES_SQL, logdb_engine, params={"history_days": history_days})
-        hb = pd.read_sql(HB_SQL, logdb_engine, params={"history_days": history_days})
+        veh_events = pd.read_sql(
+            CHARGER_VEHICLE_SQL,
+            evpdb_engine,
+            params=params,
+            parse_dates=["at"],
+            dtype={"charger_id": "Int16", "vehicle_id": "Int16", "grid_area": "Int16"},
+        )
+        statuses = pd.read_sql(
+            STATUSES_SQL,
+            logdb_engine,
+            params=params,
+            parse_dates=["at"],
+            dtype={"charger_id": "Int16", "connector_id": "Int8"},
+        )
+        hb = pd.read_sql(HB_SQL, logdb_engine, params=params, parse_dates=["at"], dtype={"charger_id": "Int16"})
+        algo = self._load_logs(log_root)
 
         return veh_events, algo, statuses, hb
 
-    def process_charging_data(self, history_days: int | None):
+    def process_charging_data(
+        self, from_time: datetime | None, to_time: datetime | None, mas_log_root: Path
+    ) -> dd.DataFrame:
         # Load Data
-        df_evp, df_schedule, df_status, df_conn = self._load_data(history_days)
+        df_evp, df_schedule, df_status, df_conn = self._load_data(from_time, to_time, mas_log_root)
 
-        for df in [df_evp, df_schedule, df_status, df_conn]:
-            if not df.empty and "charger_id" in df.columns:
-                df["charger_id"] = pd.to_numeric(df["charger_id"], errors="coerce").astype("Int32")
-        df_evp["vehicle_id"] = pd.to_numeric(df_evp["vehicle_id"], errors="coerce").astype("Int32")
-        df_evp["grid_area"] = pd.to_numeric(df_evp["grid_area"], errors="coerce").astype("Int16")
+        logging.info("Aggregating the data into 15m blocks...")
 
         # Ensure Datetime types
         for df in [df_evp, df_schedule, df_status, df_conn]:
             if not df.empty:
-                df["time_block"] = pd.to_datetime(df["time_block"], utc=True)
+                df["at"] = pd.to_datetime(df["at"], utc=True)
 
-        df_evp.to_csv("evp.csv", index=False, sep="\t")
-        df_schedule.to_csv("schedule.csv", index=False, sep="\t")
-        df_status.to_csv("status.csv", index=False, sep="\t")
-        df_conn.to_csv("conn.csv", index=False, sep="\t")
+        raw_dest = Path("raw")
+        raw_dest.mkdir(exist_ok=True)
+        df_evp.to_csv(raw_dest / "evp.csv", index=False, sep="\t")
+        df_schedule.to_csv(raw_dest / "schedule.csv", index=False, sep="\t")
+        df_status.to_csv(raw_dest / "status.csv", index=False, sep="\t")
+        df_conn.to_csv(raw_dest / "conn.csv", index=False, sep="\t")
 
-        dfs = [df_evp, df_schedule, df_status, df_conn]
+        df_evp = self._aggregate(
+            df_evp,
+            ["charger_id", "vehicle_id"],
+            {
+                "serial_id": self._agg_last,
+                "price_area": self._agg_last,  # type: ignore
+                "grid_area": self._agg_last,
+                "user_battery_kwh": self._agg_last,
+                "is_plugged_in": self._agg_mode,
+                "is_charging": self._agg_mode,
+                "is_fully_charged": self._agg_mode,
+                "battery_level_pct": self._agg_last,
+                "enode_battery_kwh": self._agg_last,
+            },
+        )
+        df_schedule = self._aggregate(
+            df_schedule,
+            ["serial_id"],
+            {
+                "ready_time": self._agg_last,
+                "target_soc": self._agg_last,
+            },
+        )
+        df_status = self._aggregate(
+            df_status,
+            ["charger_id", "connector_id"],
+            {"status": self._agg_mode},
+        )
+        df_conn = self._aggregate(
+            df_conn,
+            ["charger_id"],
+            {"is_charger_connected": self._agg_mode},
+        )
 
-        final_df = reduce(lambda left, right: pd.merge(left, right, on=["time_block", "charger_id"], how="left"), dfs)
-        final_df["is_connected"].fillna(False, inplace=True)
-        # Fill NaN values in 'target_kwh' with the previous valid observation for each charger
-        final_df["target_kwh"] = final_df.groupby("charger_id")["target_kwh"].ffill()
+        df_evp.to_csv(raw_dest / "evp_resampled.csv", index=False, sep="\t")
+        df_schedule.to_csv(raw_dest / "schedule_resampled.csv", index=False, sep="\t")
+        df_status.to_csv(raw_dest / "status_resampled.csv", index=False, sep="\t")
+        df_conn.to_csv(raw_dest / "conn_resampled.csv", index=False, sep="\t")
 
-        # battery_level_pct mapped from enode_soc
-        final_df["battery_level_pct"] = final_df["enode_soc"]
+        logging.info("Merging the tables...")
+        dd_evp: dd.DataFrame = dd.from_pandas(df_evp, npartitions=4)
+        dd_schedule: dd.DataFrame = dd.from_pandas(df_schedule, npartitions=4)
+        dd_status: dd.DataFrame = dd.from_pandas(df_status, npartitions=4)
+        dd_conn: dd.DataFrame = dd.from_pandas(df_conn, npartitions=4)
 
-        # target_kwh duplication
-        final_df["target_kwh_min"] = final_df["target_kwh"]
-        final_df["target_kwh_max"] = final_df["target_kwh"]
+        final_dd: dd.DataFrame = dd_evp.merge(dd_schedule, on=["time_block", "serial_id"], how="outer")
+        # Put all rows for the same serial_id in the same partition, then ffill locally
+        final_dd["serial_id"] = final_dd["serial_id"].fillna("X")
+        final_dd = final_dd.set_index("serial_id", drop=True, shuffle="tasks")
+        final_dd = final_dd.map_partitions(self._ffill_schedule_partition, meta=final_dd._meta)
+        final_dd = final_dd[final_dd["charger_id"].notnull()]
+        final_dd = final_dd.reset_index()
 
-        # Rename is_connected to is_charger_connected
-        final_df = final_df.rename(columns={"is_connected": "is_charger_connected"})
-        final_df["connector_id"] = pd.to_numeric(final_df["connector_id"], errors="coerce").astype("Int8")
+        final_dd: dd.DataFrame = final_dd.merge(dd_status, on=["time_block", "charger_id"], how="left")
+        final_dd: dd.DataFrame = final_dd.merge(dd_conn, on=["time_block", "charger_id"], how="left")
 
-        # Select specific output columns in order
+        logging.info("Filling the gaps...")
+        # Now we can apply the fill logic to each partition independently without talking to other partitions
+        final_dd = final_dd.map_partitions(self._fill_partition)
+
+        # Only sort by time at the very end if strictly necessary for the CSV output
+        # Warning: This is still expensive. If you can consume the CSV unsorted, remove this.
+        final_dd = final_dd.sort_values(by="time_block")
+        final_dd["target_soc_min"] = final_dd["target_soc"]
+        final_dd["target_soc_max"] = final_dd["target_soc"]
+
         output_columns = [
             "time_block",
             "charger_id",
@@ -409,18 +305,19 @@ class DataFetcher:
             "grid_area",
             "user_battery_kwh",
             "enode_battery_kwh",
+            "battery_level_pct",
             "is_plugged_in",
             "is_charging",
             "is_fully_charged",
-            "battery_level_pct",
             "ready_time",
-            "target_kwh_min",
-            "target_kwh_max",
+            "target_soc_min",
+            "target_soc_max",
             "status",
             "is_charger_connected",
         ]
-
-        return final_df[output_columns]
+        final_dd = final_dd[output_columns]
+        final_dd.to_csv(raw_dest / "merged.csv", index=False, sep="\t", single_file=True)
+        return final_dd
 
     @staticmethod
     def _validate_cfg(cfg: DBConnectionConfig):
