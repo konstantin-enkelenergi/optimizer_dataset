@@ -1,6 +1,5 @@
 from __future__ import annotations
 from datetime import datetime
-from functools import reduce
 import gzip
 import logging
 from pathlib import Path
@@ -100,10 +99,11 @@ class DataFetcher:
         sdf[["ready_time", "target_soc"]] = sdf.groupby("serial_id")[["ready_time", "target_soc"]].ffill()
         return sdf
 
-    def _fill_partition(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _fill_partition(self, df: dd.DataFrame) -> dd.DataFrame:
         # This runs on each partition individually
         ids = ["charger_id", "vehicle_id"]
-        df["is_charger_connected"] = df["is_charger_connected"].fillna(False)
+        if df["is_charger_connected"].count() > 0:
+            df["is_charger_connected"] = df["is_charger_connected"].fillna(False)
         # Sort inside the partition to ensure time is correct for ffill
         df = df.sort_values("time_block")
         cols = list(df.columns.difference(ids))
@@ -122,14 +122,34 @@ class DataFetcher:
             return None
         return m.iloc[0]
 
+    def _as_s_utc(self, s: pd.Series) -> pd.Series:
+        s = pd.to_datetime(s, utc=True)
+        # pandas 2.x supports unit conversion on datetime64[*, tz]
+        if hasattr(s.dt, "as_unit"):
+            return s.dt.as_unit("s")  # type: ignore
+        # fallback
+        return s.astype("datetime64[s]")
+
     def _aggregate(
         self, df: pd.DataFrame, ids: list[str], agg: dict[str, Callable], time_col: str = "at"
     ) -> pd.DataFrame:
+        if df.empty:
+            df = df.rename(columns={time_col: "time_block"})
+            # force dtype even for empty frames
+            df["time_block"] = self._as_s_utc(df["time_block"])
+            return df
+
+        # normalize input time column BEFORE resample
+        df = df.copy()
+        df[time_col] = self._as_s_utc(df[time_col])
+
         resampled = (df.groupby(ids).resample("15min", on=time_col).agg(agg)).reset_index()  # type: ignore
         group = resampled.groupby(ids)
         cols = df.columns.difference(ids)
         resampled[cols] = group[cols].ffill()
-        resampled.rename(columns={time_col: "time_block"}, inplace=True)
+
+        resampled = resampled.rename(columns={time_col: "time_block"})
+        resampled["time_block"] = self._as_s_utc(resampled["time_block"])
         return resampled
 
     def _parse_eco_log(self, log_line: str) -> tuple[datetime, str, str, int] | None:
@@ -223,12 +243,12 @@ class DataFetcher:
             if not df.empty:
                 df["at"] = pd.to_datetime(df["at"], utc=True)
 
-        raw_dest = Path("raw")
-        raw_dest.mkdir(exist_ok=True)
-        df_evp.to_csv(raw_dest / "evp.csv", index=False, sep="\t")
-        df_schedule.to_csv(raw_dest / "schedule.csv", index=False, sep="\t")
-        df_status.to_csv(raw_dest / "status.csv", index=False, sep="\t")
-        df_conn.to_csv(raw_dest / "conn.csv", index=False, sep="\t")
+        # raw_dest = Path("raw")
+        # raw_dest.mkdir(exist_ok=True)
+        # df_evp.to_csv(raw_dest / "evp.csv", index=False, sep="\t")
+        # df_schedule.to_csv(raw_dest / "schedule.csv", index=False, sep="\t")
+        # df_status.to_csv(raw_dest / "status.csv", index=False, sep="\t")
+        # df_conn.to_csv(raw_dest / "conn.csv", index=False, sep="\t")
 
         df_evp = self._aggregate(
             df_evp,
@@ -264,10 +284,10 @@ class DataFetcher:
             {"is_charger_connected": self._agg_mode},
         )
 
-        df_evp.to_csv(raw_dest / "evp_resampled.csv", index=False, sep="\t")
-        df_schedule.to_csv(raw_dest / "schedule_resampled.csv", index=False, sep="\t")
-        df_status.to_csv(raw_dest / "status_resampled.csv", index=False, sep="\t")
-        df_conn.to_csv(raw_dest / "conn_resampled.csv", index=False, sep="\t")
+        # df_evp.to_csv(raw_dest / "evp_resampled.csv", index=False, sep="\t")
+        # df_schedule.to_csv(raw_dest / "schedule_resampled.csv", index=False, sep="\t")
+        # df_status.to_csv(raw_dest / "status_resampled.csv", index=False, sep="\t")
+        # df_conn.to_csv(raw_dest / "conn_resampled.csv", index=False, sep="\t")
 
         logging.info("Merging the tables...")
         dd_evp: dd.DataFrame = dd.from_pandas(df_evp, npartitions=4)
@@ -315,8 +335,9 @@ class DataFetcher:
             "status",
             "is_charger_connected",
         ]
+        # if final_dd["is_charger_connected"].count().compute() > 0:
+        #     output_columns.append("is_charger_connected")
         final_dd = final_dd[output_columns]
-        final_dd.to_csv(raw_dest / "merged.csv", index=False, sep="\t", single_file=True)
         return final_dd
 
     @staticmethod
